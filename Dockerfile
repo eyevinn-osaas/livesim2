@@ -14,8 +14,9 @@ RUN go mod download
 RUN go build  -o ./out/livesim2 ./cmd/livesim2/main.go
 # Deploy Stage
 FROM alpine:latest
+RUN apk add --no-cache git git-lfs
 WORKDIR /
 COPY --from=BuildStage /work/out/ /
 COPY --from=BuildStage /work/cmd/livesim2/app/testdata/assets /vod
-EXPOSE 8888
-ENTRYPOINT ["/livesim2", "--logformat", "json"]
+COPY --from=BuildStage /work/entrypoint.sh /
+ENTRYPOINT ["/entrypoint.sh"]
