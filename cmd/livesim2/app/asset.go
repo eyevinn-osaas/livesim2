@@ -8,6 +8,7 @@ import (
 	"compress/gzip"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
@@ -58,22 +59,18 @@ func (am *assetMgr) addAsset(assetPath string) *asset {
 	if ast, ok := am.assets[assetPath]; ok {
 		return ast
 	}
-	ast := asset{
-		AssetPath: assetPath,
-		MPDs:      make(map[string]internal.MPDData),
-		Reps:      make(map[string]*RepData),
-	}
-	am.assets[assetPath] = &ast
-	return &ast
+	ast := newAsset(assetPath)
+	am.assets[assetPath] = ast
+	return ast
 }
 
 // discoverAssets walks the file tree and finds all directories containing MPD files.
-func (am *assetMgr) discoverAssets() error {
+func (am *assetMgr) discoverAssets(logger *slog.Logger) error {
 	err := fs.WalkDir(am.vodFS, ".", func(p string, d fs.DirEntry, err error) error {
 		if path.Ext(p) == ".mpd" {
-			err := am.loadAsset(p)
+			err := am.loadAsset(logger, p)
 			if err != nil {
-				slog.Warn("Asset loading problem. Skipping", "asset", p, "err", err.Error())
+				logger.Warn("Asset loading problem. Skipping", "asset", p, "err", err.Error())
 			}
 		}
 		return nil
@@ -86,22 +83,24 @@ func (am *assetMgr) discoverAssets() error {
 	}
 
 	for aID, a := range am.assets {
-		err := a.consolidateAsset()
+		logger := logger.With("assetPath", a.AssetPath)
+		err := a.consolidateAsset(logger)
 		if err != nil {
-			slog.Warn("Asset consolidation problem. Skipping", "error", err.Error())
+			logger.Warn("Asset consolidation problem. Skipping", "error", err.Error())
 			delete(am.assets, aID) // This deletion should be safe
 			continue
 		}
-		slog.Info("Asset consolidated", "asset", a.AssetPath, "loopDurMS", a.LoopDurMS)
+		logger.Info("Asset consolidated", "loopDurMS", a.LoopDurMS)
 	}
 	return nil
 }
 
-func (am *assetMgr) loadAsset(mpdPath string) error {
+func (am *assetMgr) loadAsset(logger *slog.Logger, mpdPath string) error {
 	assetPath, mpdName := path.Split(mpdPath)
 	if assetPath != "" {
 		assetPath = assetPath[:len(assetPath)-1]
 	}
+	logger = logger.With("assetPath", assetPath, "mpdName", mpdName)
 	asset := am.addAsset(assetPath)
 	md := internal.ReadMPDData(am.vodFS, mpdPath)
 
@@ -144,10 +143,10 @@ func (am *assetMgr) loadAsset(mpdPath string) error {
 				return fmt.Errorf("segmentTemplate on Representation level. Only supported on AdaptationSet level")
 			}
 			if _, ok := asset.Reps[rep.Id]; ok {
-				slog.Debug("Representation already loaded", "rep", rep.Id, "asset", mpdPath)
+				logger.Debug("Representation already loaded", "rep", rep.Id)
 				continue
 			}
-			r, err := am.loadRep(assetPath, mpd, as, rep)
+			r, err := am.loadRep(logger, assetPath, as, rep)
 			if err != nil {
 				return fmt.Errorf("getRep: %w", err)
 			}
@@ -166,24 +165,25 @@ func (am *assetMgr) loadAsset(mpdPath string) error {
 			}
 		}
 	}
-	slog.Info("asset MPD loaded", "asset", assetPath, "mpdName", mpdPath)
+	logger.Info("Asset MPD loaded")
 	return nil
 }
 
-func (am *assetMgr) loadRep(assetPath string, mpd *m.MPD, as *m.AdaptationSetType, rep *m.RepresentationType) (*RepData, error) {
+func (am *assetMgr) loadRep(logger *slog.Logger, assetPath string, as *m.AdaptationSetType, rep *m.RepresentationType) (*RepData, error) {
+	logger = logger.With("rep", rep.Id)
 	rp := RepData{ID: rep.Id,
 		ContentType:  string(as.ContentType),
 		Codecs:       as.Codecs,
 		MpdTimescale: 1,
 	}
 	if !am.writeRepData {
-		ok, err := rp.readFromJSON(am.vodFS, am.repDataDir, assetPath)
+		ok, err := rp.loadFromJSON(logger, am.vodFS, am.repDataDir, assetPath)
 		if ok {
-			slog.Info("Representation loaded from JSON", "rep", rp.ID, "asset", assetPath)
+			logger.Debug("Loaded representation data from JSON")
 			return &rp, err
 		}
 	}
-	slog.Debug("Loading full representation", "rep", rp.ID, "asset", assetPath)
+	logger.Debug("Loading full representation by reading all segments")
 	st := as.SegmentTemplate
 	if rep.SegmentTemplate != nil {
 		st = rep.SegmentTemplate
@@ -199,7 +199,7 @@ func (am *assetMgr) loadRep(assetPath string, mpd *m.MPD, as *m.AdaptationSetTyp
 	if st.Timescale != nil {
 		rp.MpdTimescale = int(*st.Timescale)
 	}
-	err := rp.addRegExpAndInit(am.vodFS, assetPath)
+	err := rp.addRegExpAndInit(logger, am.vodFS, assetPath)
 	if err != nil {
 		return nil, fmt.Errorf("addRegExpAndInit: %w", err)
 	}
@@ -248,13 +248,16 @@ func (am *assetMgr) loadRep(assetPath string, mpd *m.MPD, as *m.AdaptationSetTyp
 			rp.MediaTimescale = int(as.SegmentTemplate.GetTimescale())
 		}
 		for {
-			// Loop until we get an error when reading the segment
+			// Loop until we cannot find more files
 			if rp.ContentType != "image" {
 				seg, err = rp.readMP4Segment(am.vodFS, assetPath, 0, nr)
 			} else {
 				seg, err = rp.readThumbSegment(am.vodFS, assetPath, nr, startNr, segDur)
 			}
 			if err != nil {
+				if !errors.Is(err, fs.ErrNotExist) {
+					return nil, fmt.Errorf("readSegment %w", err)
+				}
 				endNr = nr - 1
 				break
 			}
@@ -292,15 +295,12 @@ segLoop:
 	if !am.writeRepData {
 		return &rp, nil
 	}
-	err = rp.writeToJSON(am.repDataDir, assetPath)
-	if err == nil {
-		slog.Info("Representation  data written to JSON file", "rep", rp.ID, "asset", assetPath)
-	}
+	err = rp.writeToJSON(logger, am.repDataDir, assetPath)
 	return &rp, err
 }
 
-// readFromJSON reads the representation data from a gzipped  or plain JSON file.
-func (rp *RepData) readFromJSON(vodFS fs.FS, repDataDir, assetPath string) (bool, error) {
+// loadFromJSON reads the representation data from a gzipped or plain JSON file.
+func (rp *RepData) loadFromJSON(logger *slog.Logger, vodFS fs.FS, repDataDir, assetPath string) (bool, error) {
 	if repDataDir == "" {
 		return false, nil
 	}
@@ -323,7 +323,7 @@ func (rp *RepData) readFromJSON(vodFS fs.FS, repDataDir, assetPath string) (bool
 		if err != nil {
 			return true, err
 		}
-		slog.Debug("Read repdata", "path", gzipPath)
+		logger.Info("Read gzipped repdata", "path", gzipPath)
 	}
 	if len(data) == 0 {
 		_, err := os.Stat(repDataPath)
@@ -332,7 +332,7 @@ func (rp *RepData) readFromJSON(vodFS fs.FS, repDataDir, assetPath string) (bool
 			if err != nil {
 				return true, err
 			}
-			slog.Debug("Read repdata", "path", repDataPath)
+			logger.Info("Read repdata", "path", repDataPath)
 		}
 	}
 	if len(data) == 0 {
@@ -341,14 +341,14 @@ func (rp *RepData) readFromJSON(vodFS fs.FS, repDataDir, assetPath string) (bool
 	if err := json.Unmarshal(data, &rp); err != nil {
 		return true, err
 	}
-	err = rp.addRegExpAndInit(vodFS, assetPath)
+	err = rp.addRegExpAndInit(logger, vodFS, assetPath)
 	if err != nil {
 		return true, fmt.Errorf("addRegExpAndInit: %w", err)
 	}
 	return true, nil
 }
 
-func (rp *RepData) addRegExpAndInit(vodFS fs.FS, assetPath string) error {
+func (rp *RepData) addRegExpAndInit(logger *slog.Logger, vodFS fs.FS, assetPath string) error {
 	switch {
 	case strings.Contains(rp.MediaURI, "$Number$"):
 		rexStr := strings.ReplaceAll(rp.MediaURI, "$Number$", `(\d+)`)
@@ -361,7 +361,7 @@ func (rp *RepData) addRegExpAndInit(vodFS fs.FS, assetPath string) error {
 	}
 
 	if rp.ContentType != "image" {
-		err := rp.readInit(vodFS, assetPath)
+		err := rp.readInit(logger, vodFS, assetPath)
 		if err != nil {
 			return err
 		}
@@ -370,7 +370,8 @@ func (rp *RepData) addRegExpAndInit(vodFS fs.FS, assetPath string) error {
 }
 
 // writeToJSON writes the representation data to a gzipped JSON file.
-func (rp *RepData) writeToJSON(repDataDir, assetPath string) error {
+func (rp *RepData) writeToJSON(logger *slog.Logger, repDataDir, assetPath string) error {
+	logger = logger.With("rep", rp.ID, "assetPath", assetPath)
 	if repDataDir == "" {
 		return nil
 	}
@@ -397,7 +398,7 @@ func (rp *RepData) writeToJSON(repDataDir, assetPath string) error {
 	if err != nil {
 		return err
 	}
-	slog.Debug("Wrote repData", "path", gzipPath)
+	logger.Info("Wrote repData", "path", gzipPath)
 	return nil
 }
 
@@ -420,6 +421,14 @@ type asset struct {
 	LoopDurMS    int                         `json:"loopDurationMS"`
 	Reps         map[string]*RepData         `json:"representations"`
 	refRep       *RepData                    `json:"-"` // First video or audio representation
+}
+
+func newAsset(assetPath string) *asset {
+	return &asset{
+		AssetPath: assetPath,
+		MPDs:      make(map[string]internal.MPDData),
+		Reps:      make(map[string]*RepData),
+	}
 }
 
 func (a *asset) getVodMPD(mpdName string) (*m.MPD, error) {
@@ -522,7 +531,7 @@ func (a *asset) generateTimelineEntries(repID string, wt wrapTimes, atoMS int) s
 
 // generateTimelineEntriesFromRef generates timeline entries for the given representation given reference.
 // This is based on sample duration and the type of media.
-func (a *asset) generateTimelineEntriesFromRef(refSE segEntries, repID string, wt wrapTimes, atoMS int) segEntries {
+func (a *asset) generateTimelineEntriesFromRef(refSE segEntries, repID string) segEntries {
 	rep := a.Reps[repID]
 	nrSegs := 0
 	for _, rs := range refSE.entries {
@@ -546,22 +555,64 @@ func (a *asset) generateTimelineEntriesFromRef(refSE segEntries, repID string, w
 	refT := *refSE.entries[0].T
 	nextRefT := refT
 	t := calcAudioTimeFromRef(refT, refTimescale, sampleDur, timeScale)
+
+	// Apply editListOffset adjustment to presentation time
+	editListOffset := uint64(rep.EditListOffset)
+	expectedTime := t // Track what the time should be without explicit T
 	var s *m.S
+
 	for _, rs := range refSE.entries {
 		refD := rs.D
 		for j := 0; j <= rs.R; j++ {
 			nextRefT += refD
 			nextT := calcAudioTimeFromRef(nextRefT, refTimescale, sampleDur, timeScale)
 			d := nextT - t
+
 			if s == nil {
-				s = &m.S{T: m.Ptr(t), D: d}
+				// First segment: apply editListOffset adjustment
+				adjustedT := t
+				adjustedD := d
+
+				if editListOffset > 0 {
+					if t >= editListOffset {
+						// Normal case: shift time down by editListOffset
+						adjustedT = t - editListOffset
+					} else {
+						// Special case: time would be negative, so clamp to 0 and shorten duration
+						adjustedT = 0
+						if d > editListOffset-t {
+							adjustedD = d - (editListOffset - t)
+						} else {
+							adjustedD = 0
+						}
+					}
+				}
+
+				s = &m.S{T: m.Ptr(adjustedT), D: adjustedD}
 				se.entries = append(se.entries, s)
+				expectedTime = adjustedT + adjustedD // Update expected time after first segment
 			} else {
+				// Subsequent segments
 				if s.D != d {
-					s = &m.S{D: d}
+					// New segment with different duration
+					adjustedT := t
+					if editListOffset > 0 && t >= editListOffset {
+						adjustedT = t - editListOffset
+					}
+
+					// Only add explicit T if the time is not continuous
+					if adjustedT == expectedTime {
+						// Time is continuous, no need for explicit T
+						s = &m.S{D: d}
+					} else {
+						// Time is discontinuous, need explicit T
+						s = &m.S{T: m.Ptr(adjustedT), D: d}
+					}
 					se.entries = append(se.entries, s)
+					expectedTime = adjustedT + d
 				} else {
 					s.R++
+					expectedTime += d
 				}
 			}
 			t = nextT
@@ -592,7 +643,8 @@ func (a *asset) setReferenceRep() error {
 }
 
 // consolidateAsset sets up reference track and loop duration if possible
-func (a *asset) consolidateAsset() error {
+func (a *asset) consolidateAsset(logger *slog.Logger) error {
+	logger = logger.With("assetPath", a.AssetPath)
 	err := a.setReferenceRep()
 	if err != nil {
 		return fmt.Errorf("setReferenceRep: %w", err)
@@ -603,20 +655,125 @@ func (a *asset) consolidateAsset() error {
 		// This is not an integral number of milliseconds, so we should drop this asset
 		return fmt.Errorf("cannot match loop duration %d for asset %s rep %s", a.LoopDurMS, a.AssetPath, refRep.ID)
 	}
+	badPreEncrypted := false
 	for _, rep := range a.Reps {
-		if rep.ContentType != refRep.ContentType {
+		if rep.ContentType != refRep.ContentType && !rep.PreEncrypted {
 			continue
 		}
 		repDurMS := 1000 * rep.duration() / rep.MediaTimescale
 		if repDurMS != a.LoopDurMS {
-			slog.Info("Rep duration differs from loop duration", "rep", rep.ID, "asset", a.AssetPath)
+			logger.Warn("Duration differs", "representation", rep.ID, "referenceRepresentation", refRep.ID, "refDurMS",
+				a.LoopDurMS, "repDurMS", repDurMS)
+			badPreEncrypted = true
 		}
 	}
+	if badPreEncrypted {
+		return fmt.Errorf("pre-encrypted representations do not all have same duration")
+	}
+
+	// Validate editListOffset consistency for audio representations
+	err = a.validateEditListOffsetConsistency(logger)
+	if err != nil {
+		return fmt.Errorf("editListOffset validation failed: %w", err)
+	}
+
+	return nil
+}
+
+// validateEditListOffsetConsistency validates that for audio segments with editListOffset,
+// the base media decode time - editListOffset maps to the MPD timestamps.
+// This test fails when editListOffset is not taken into account properly.
+func (a *asset) validateEditListOffsetConsistency(logger *slog.Logger) error {
+	// Check audio representations with editListOffset
+	for _, rep := range a.Reps {
+		if rep.ContentType != "audio" || rep.EditListOffset <= 0 {
+			continue
+		}
+
+		logger.Debug("Validating editListOffset consistency", "rep", rep.ID, "editListOffset", rep.EditListOffset)
+
+		// Find the corresponding SegmentTemplate in the original MPDs
+		// Check all MPDs as a representation may exist in multiple MPDs
+		var segmentTemplates []*m.SegmentTemplateType
+		for mpdName := range a.MPDs {
+			mpd, err := a.getVodMPD(mpdName)
+			if err != nil {
+				continue
+			}
+			for _, as := range mpd.Periods[0].AdaptationSets {
+				for _, r := range as.Representations {
+					if r.Id == rep.ID && as.SegmentTemplate != nil && as.SegmentTemplate.SegmentTimeline != nil {
+						segmentTemplates = append(segmentTemplates, as.SegmentTemplate)
+					}
+				}
+			}
+		}
+
+		if len(segmentTemplates) == 0 {
+			logger.Debug("No SegmentTimeline found for representation", "rep", rep.ID)
+			continue
+		}
+
+		// Extract times from the original MPD SegmentTimeline (use first template found)
+		segmentTemplate := segmentTemplates[0]
+		var mpdTimes []uint64
+		var t uint64
+		for _, s := range segmentTemplate.SegmentTimeline.S {
+			if s.T != nil {
+				t = *s.T
+			}
+			mpdTimes = append(mpdTimes, t)
+			t += s.D
+			for i := 0; i < s.R; i++ {
+				mpdTimes = append(mpdTimes, t)
+				t += s.D
+			}
+		}
+
+		editListOffset := uint64(rep.EditListOffset)
+
+		// Compare BMDT values with MPD times, accounting for editListOffset
+		for i := 0; i < len(rep.Segments) && i < len(mpdTimes) && i < 3; i++ {
+			seg := rep.Segments[i]
+			actualBMDT := seg.StartTime
+			originalMPDTime := mpdTimes[i]
+
+			// Calculate what the live MPD presentation time should be with editListOffset applied
+			var expectedLiveMPDTime uint64
+			if i == 0 && originalMPDTime < editListOffset {
+				// First segment: time would be negative, so clamp to 0
+				expectedLiveMPDTime = 0
+			} else {
+				// Normal case: shift time down by editListOffset
+				expectedLiveMPDTime = originalMPDTime - editListOffset
+			}
+
+			// Key validation: Check the relationship between BMDT and MPD times
+			// For segment 0, BMDT should equal original MPD time (usually 0)
+			// For other segments, BMDT should equal original MPD time + editListOffset
+			var expectedBMDT uint64
+			if i == 0 {
+				expectedBMDT = originalMPDTime // Segment 0 doesn't include editListOffset in BMDT
+			} else {
+				expectedBMDT = originalMPDTime + editListOffset // Other segments include editListOffset
+			}
+
+			if actualBMDT != expectedBMDT {
+				return fmt.Errorf("segment %d BMDT %d does not match expected %d (original MPD time %d, editListOffset %d)",
+					i, actualBMDT, expectedBMDT, originalMPDTime, editListOffset)
+			}
+
+			logger.Debug("EditListOffset validation passed", "segment", i, "BMDT", actualBMDT,
+				"originalMPDTime", originalMPDTime, "editListOffset", editListOffset,
+				"liveMPDTime", expectedLiveMPDTime)
+		}
+	}
+
 	return nil
 }
 
 // getRefSegMeta returns the segment metadata for reference representation at nrOrTime.
-func (a *asset) getRefSegMeta(nrOrTime int, cfg *ResponseConfig, timeScale, nowMS int) (ref segMeta, err error) {
+func (a *asset) getRefSegMeta(nrOrTime int, cfg *ResponseConfig, nowMS int) (ref segMeta, err error) {
 	switch cfg.liveMPDType() {
 	case segmentNumber, timeLineNumber:
 		nr := uint32(nrOrTime)
@@ -661,6 +818,7 @@ type RepData struct {
 	Segments               []Segment        `json:"segments"`
 	DefaultSampleDuration  uint32           `json:"defaultSampleDuration"`            // Read from trex or tfhd
 	ConstantSampleDuration *uint32          `json:"constantSampleDuration,omitempty"` // Non-zero if all samples have the same duration
+	EditListOffset         int64            `json:"editListOffset,omitempty"`
 	PreEncrypted           bool             `json:"preEncrypted"`
 	mediaRegexp            *regexp.Regexp   `json:"-"`
 	initSeg                *mp4.InitSegment `json:"-"`
@@ -669,15 +827,17 @@ type RepData struct {
 }
 
 type repEncData struct {
-	keyID         id16   // Should be common within one AdaptationSet, but for now common for one asset
-	key           id16   // Should be common within one AdaptationSet, but for now common for one asset
-	iv            []byte // Can be random, but we use a constant default value at start
-	cbcsPD        *mp4.InitProtectData
-	cencPD        *mp4.InitProtectData
-	cbcsInitSeg   *mp4.InitSegment
-	cencInitSeg   *mp4.InitSegment
-	cbcsInitBytes []byte
-	cencInitBytes []byte
+	keyID   id16   // Should be common within one AdaptationSet, but for now common for one asset
+	key     id16   // Should be common within one AdaptationSet, but for now common for one asset
+	iv      []byte // Can be random, but we use a constant default value at start
+	initEnc map[string]initEncData
+}
+
+type initEncData struct {
+	scheme  string
+	pd      *mp4.InitProtectData
+	init    *mp4.InitSegment
+	initRaw []byte
 }
 
 var defaultIV = []byte{0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07}
@@ -697,6 +857,9 @@ func (r RepData) sampleDur() uint32 {
 	switch {
 	case strings.HasPrefix(r.Codecs, "mp4a.40") && r.MediaTimescale == 48000:
 		return 1024
+	// TODO support other timescale such as 32kHz and 44.1kHz
+	case (strings.HasPrefix(r.Codecs, "ac-3") || strings.HasPrefix(r.Codecs, "ec-3")) && r.MediaTimescale == 48000:
+		return 1536
 	default:
 		return 0
 	}
@@ -738,18 +901,29 @@ func (r RepData) typeURI() mediaURIType {
 }
 
 func prepareForEncryption(codec string) bool {
-	return strings.HasPrefix(codec, "avc") || strings.HasPrefix(codec, "mp4a.40")
+	encryptionCodecPrefixes := []string{"avc", "hev", "hvc", "mp4", "ac-3", "ec-3", "ac-4"}
+	for _, prefix := range encryptionCodecPrefixes {
+		if strings.HasPrefix(codec, prefix) {
+			return true
+		}
+	}
+	return false
 }
 
-func (r *RepData) readInit(vodFS fs.FS, assetPath string) error {
-	data, err := fs.ReadFile(vodFS, path.Join(assetPath, r.InitURI))
+func (r *RepData) readInit(logger *slog.Logger, vodFS fs.FS, assetPath string) error {
+	rawInit, err := fs.ReadFile(vodFS, path.Join(assetPath, r.InitURI))
 	if err != nil {
 		return fmt.Errorf("read initURI %q: %w", r.InitURI, err)
 	}
-	r.initSeg, err = getInitSeg(data)
+	r.initSeg, err = getInitSeg(rawInit)
 	if err != nil {
 		return fmt.Errorf("decode init: %w", err)
 	}
+	editListOffset, err := getCmafElstOffset(r.initSeg)
+	if err != nil {
+		return fmt.Errorf("getElstOffset: %w", err)
+	}
+	r.EditListOffset = editListOffset
 	r.initBytes, err = getInitBytes(r.initSeg)
 	if err != nil {
 		return fmt.Errorf("getInitBytes: %w", err)
@@ -757,7 +931,7 @@ func (r *RepData) readInit(vodFS fs.FS, assetPath string) error {
 
 	if prepareForEncryption(r.Codecs) {
 		assetName := path.Base(assetPath)
-		err = r.addEncryption(assetName, data)
+		err = r.addEncryption(logger, assetName)
 		if err != nil {
 			return fmt.Errorf("addEncryption: %w", err)
 		}
@@ -774,60 +948,86 @@ func (r *RepData) readInit(vodFS fs.FS, assetPath string) error {
 	return nil
 }
 
-func (r *RepData) addEncryption(assetName string, data []byte) error {
-	// Set up the encryption data for this representation given asset
-	ed := repEncData{}
-	ed.keyID = kidFromString(assetName)
-	ed.key = kidToKey(ed.keyID)
-	ed.iv = defaultIV
-
-	// Generate cbcs data or exit if already encrypted
-	initSeg, err := getInitSeg(data)
+func checkPreEncrypted(logger *slog.Logger, rawInit []byte) (bool, error) {
+	initSeg, err := getInitSeg(rawInit)
 	if err != nil {
-		return fmt.Errorf("decode init: %w", err)
+		return false, fmt.Errorf("decode init: %w", err)
 	}
 	stsd := initSeg.Moov.Trak.Mdia.Minf.Stbl.Stsd
 	for _, c := range stsd.Children {
-		switch c.Type() {
-		case "encv", "enca":
-			slog.Info("asset", assetName, "repID", r.ID, "Init segment already encrypted")
-			r.PreEncrypted = true
-			return nil
+		switch box := c.(type) {
+		case *mp4.VisualSampleEntryBox:
+			if box.Type() == "encv" && box.Sinf != nil && box.Sinf.Schm != nil {
+				logger.Info("Video pre-encrypted", "scheme", box.Sinf.Schm.SchemeType)
+				return true, nil
+			}
+		case *mp4.AudioSampleEntryBox:
+			if box.Type() == "enca" && box.Sinf != nil && box.Sinf.Schm != nil {
+				logger.Info("Audio pre-encrypted", "scheme", box.Sinf.Schm.SchemeType)
+				return true, nil
+			}
 		}
 	}
-	kid, err := mp4.NewUUIDFromHex(hex.EncodeToString(ed.keyID[:]))
+	return false, nil
+}
+
+// genEncInit generates an init segment adapted for encrypted content
+func genEncInit(rawInit []byte, kid id16, iv []byte, scheme string) (*mp4.InitProtectData, *mp4.InitSegment, error) {
+	initSeg, err := getInitSeg(rawInit)
 	if err != nil {
-		return fmt.Errorf("new uuid: %w", err)
+		return nil, nil, fmt.Errorf("decode init: %w", err)
 	}
-	ipd, err := mp4.InitProtect(initSeg, nil, ed.iv, "cbcs", kid, nil)
+	kidUUI, err := mp4.NewUUIDFromString(hex.EncodeToString(kid[:]))
 	if err != nil {
-		return fmt.Errorf("init protect cbcs: %w", err)
+		return nil, nil, fmt.Errorf("new uuid: %w", err)
 	}
-	slog.Info("Encrypted init segment with cbcs", "asset", assetName, "repID", r.ID)
-	ed.cbcsPD = ipd
-	ed.cbcsInitSeg = initSeg
-	ed.cbcsInitBytes, err = getInitBytes(initSeg)
+	ipd, err := mp4.InitProtect(initSeg, nil, iv, scheme, kidUUI, nil)
 	if err != nil {
-		return fmt.Errorf("getInitBytes: %w", err)
+		return nil, nil, fmt.Errorf("init protect %s: %w", scheme, err)
+	}
+	return ipd, initSeg, nil
+}
+
+func (r *RepData) addEncryption(logger *slog.Logger, assetName string) error {
+	logger = logger.With("init", r.InitURI)
+	// Set up the encryption data for this representation given asset
+	kid := kidFromString(assetName)
+	red := repEncData{
+		keyID:   kid,
+		key:     kidToKey(kid),
+		iv:      defaultIV,
+		initEnc: make(map[string]initEncData, 2),
 	}
 
-	// Generate cenc data
-	initSeg, err = getInitSeg(data)
+	preEncrypted, err := checkPreEncrypted(logger, r.initBytes)
 	if err != nil {
-		return fmt.Errorf("decode init: %w", err)
+		return fmt.Errorf("checkPreEncrypted: %w", err)
 	}
-	ipd, err = mp4.InitProtect(initSeg, nil, ed.iv, "cenc", kid, nil)
-	if err != nil {
-		return fmt.Errorf("init protect cenc: %w", err)
+	if preEncrypted {
+		r.PreEncrypted = true
+		return nil
 	}
-	slog.Info("Encrypted init segment with cenc", "asset", assetName, "repID", r.ID)
-	ed.cencPD = ipd
-	ed.cencInitSeg = initSeg
-	ed.cencInitBytes, err = getInitBytes(initSeg)
-	if err != nil {
-		return fmt.Errorf("getInitBytes: %w", err)
+
+	rawInit := r.initBytes
+	for _, scheme := range []string{"cbcs", "cenc"} {
+		initProtect, initSeg, error := genEncInit(rawInit, red.keyID, red.iv, scheme)
+		if error != nil {
+			return fmt.Errorf("genEncInit: %w", error)
+		}
+		logger.Info("Generated init segment for encryption", "scheme", scheme)
+		rawEncInit, err := getInitBytes(initSeg)
+		if err != nil {
+			return fmt.Errorf("getInitBytes: %w", err)
+		}
+		rd := initEncData{
+			scheme:  scheme,
+			pd:      initProtect,
+			init:    initSeg,
+			initRaw: rawEncInit,
+		}
+		red.initEnc[scheme] = rd
 	}
-	r.encData = &ed
+	r.encData = &red
 	return nil
 }
 
@@ -921,6 +1121,12 @@ func replaceTimeAndNr(str string, time uint64, nr uint32) string {
 	return str
 }
 
+func replaceTimeOrNr(str string, val int) string {
+	str = strings.ReplaceAll(str, "$Time$", strconv.Itoa(val))
+	str = strings.ReplaceAll(str, "$Number$", strconv.Itoa(val))
+	return str
+}
+
 type Segment struct {
 	StartTime       uint64 `json:"startTime"`
 	EndTime         uint64 `json:"endTime"`
@@ -930,4 +1136,33 @@ type Segment struct {
 
 func (s Segment) dur() uint64 {
 	return s.EndTime - s.StartTime
+}
+
+// getCmafElstOffset returns the offset of the elst box in the init segment.
+// The offset is the mediaTime in an elst box compliant with CMAF to
+// have 1 entry, segment_duration = 0, and media_rate = 1.
+// Currently, edit lists only support for audio tracks.
+func getCmafElstOffset(initSeg *mp4.InitSegment) (int64, error) {
+	if initSeg == nil || initSeg.Moov == nil || len(initSeg.Moov.Traks) != 1 {
+		return 0, fmt.Errorf("invalid init segment")
+	}
+	if initSeg.Moov.Traks[0].Edts == nil {
+		return 0, nil
+	}
+	trak := initSeg.Moov.Traks[0]
+	edts := trak.Edts
+	if hdlrType := trak.Mdia.Hdlr.HandlerType; hdlrType != "soun" && hdlrType != "vide" {
+		return 0, fmt.Errorf("found handler type %q. elst offset only supported for audio and video tracks", hdlrType)
+	}
+	if len(edts.Elst) != 1 {
+		return 0, fmt.Errorf("expected exactly one elst entry, got %d", len(edts.Elst))
+	}
+	if len(edts.Elst[0].Entries) != 1 {
+		return 0, fmt.Errorf("expected exactly one entry in elst, got %d", len(edts.Elst[0].Entries))
+	}
+	e := edts.Elst[0].Entries[0]
+	if e.SegmentDuration != 0 || e.MediaRateInteger != 1 || e.MediaRateFraction != 0 {
+		return 0, fmt.Errorf("invalid CMAF elst entry")
+	}
+	return e.MediaTime, nil
 }

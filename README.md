@@ -157,16 +157,13 @@ the 1970 Epoch start, and makes it possible to test time-dependent requests in a
 
 ## Get Started
 
-Install Go 1.19 or later.
+Install Go 1.23 or later.
 
 Then run
 
 ```sh
 > go mod tidy
 ```
-
-(or `go mod vendor`)
-
 to fetch and install all dependencies.
 
 To build `dashfetcher` and `livesim2` you can use the `Makefile` like
@@ -206,21 +203,38 @@ and set the `port` to 443.`
 
 The content must be a DASH VoD asset in `isoff-live` format
 (individual segment files) with either `SegmentTimeline with $Time$` or
-`SegmentTemplate with $Number$`. The video segment duration must
-be constant and an integral number of milliseconds. Audio output segments will be
-adjusted to start at, or less than one audio frame after, each video segment start.
+`SegmentTemplate with $Number$`. The video segments duration must have an
+exact average duration so that the total duration is the number of segments
+time that average. The total duration must be an integral number of milliseconds.
+For example, an asset with alternating segment duration sof 8s and 4s, is fine
+as long as there are an equal number of each leading so that the avererage duration is
+6s. The segment duration is not allowed to vary more than 50% compared to that
+average duration in order for livesim2 to be able to generate MPDs with SegmentTemplate
+with \$Number\$.
+
+The input audio segment do not need to follow the duration of the video segments,
+although it is beneficial if they are the same, as for example 1.92s segments for
+50fps video and 48kHz AAC audio. If the audio segment duration is not identical to
+the corresponding video segment, the audio will be resegmented as to follow the
+video segments as far as possible. Every audio segment will start less than one audio
+frame after the video segment starts.
 
 There are multiple ways to get content to the livesim2 server.
 
-1. Use the bundled test content (only 8s long)
+1. Use the bundled test content (only 8s or 12s long)
 2. Fetch content that was used with [livesim1][1] from
    github at [livesim-content][livesim-content]
 3. Use the `dashfetcher` tool to download a DASH asset
-4. Copy an existing VoD asset in `isoff-live`
+4. Use an existing VoD asset in `isoff-live` profile
 
-There is special representation data that can be used for quicker loading of the
-assets. The generation of such data is controlled via the `writerepdata` and
-`repdataroot` configuration parameters.
+livesim2 will scan all the segments of all representations and store metadata about
+each segments timing in memory.
+
+To avoid doing this at every startup, livesim2 supports storing and reading
+such representation data from a file. The generation of such data is controlled via the `writerepdata` and `repdataroot` configuration parameters.
+
+If such files are detected at startup, they will be used instead of scanning the files,
+unles the `writerepdata` parameter is set.
 
 ### Bundled test streams with the livesim2 server
 
@@ -250,6 +264,22 @@ SegmentTimeline with `$Time$`, one should add the parameter `/segtimeline_1` bet
 Adding longer assets somewhere under the `vodroot` results in longer loops.
 All sources are NTP synchronized (using the host machine clock) with a initial start
 time given by availabilityStartTime and wrap every sequence duration after that.
+
+#### Edit lists
+
+CMAF allows two types of edit lists.
+
+1. Time-shift for audio priming in audio streams
+2. Time-shift for video to initial zero-valued presentation time
+
+There are two test assets included for these cases
+
+1. `WAVE/av/combined.mpod` has shifted audio where the first two frames are used for priming. This is seen
+    in the MPD which has a shorter initial segment. This is reflected in the livesim2 MPD where all
+    segments are shifted by this amount
+2. `bbb_hevc_ac3_8s/manifest.mpd` has an edit list for video which shifts all composition time offsets
+    so that the first presentation time is zero. This shift is kept in the MPD and in the `sidx` boxes
+    of the output from livesim2
 
 ### livesim-content at Github
 
@@ -337,17 +367,29 @@ access the server's root URL.
 
 ### Docker
 
-A simple `Dockerfile` is also provided. It builds a stand-alone livesim2
-image bundled with the test content that is provided in this repo.
-Some comments are included in the Dockerfile. Check the options of livesim2
-to find out how to add other content, HTTPs etc.
+A `Dockerfile` is also provided. It builds a stand-alone livesim2 service.
+A new image is automatically built and uploaded to the Github Container Registry (ghcr.io)
+for each new release. To use the v1.7.0 image with a folder `test_streams` with
+VoD assets, you can use docker compose to mount `test_streams` in the
+default folder path `/vod` by using a compose.yml file like this:
+
+```yaml
+services:
+  livesim2:
+    image: ghcr.io/dash-industry-forum/livesim2/livesim2:v1.7.0
+    ports:
+      - 8888:8888
+    volumes:
+      - ./test_streams:/vod/test_streams
+    restart: always
+```
 
 ## List of functionality and options
 
 The most direct information about the URL parameters
-and how to find them, is available via the `urlgen`
+and how to find them, is available via the `/urlgen/`
 page that can be reached once the server is running.
-The livesim2 online page is [urlgen][urlgen].
+The livesim2 online page is [/urlgen/][urlgen].
 
 The URL parameters are also listed on this project's Wiki page
 [URL-parameters][urlparams]. Some more information

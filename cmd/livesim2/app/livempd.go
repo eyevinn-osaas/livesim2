@@ -5,6 +5,7 @@
 package app
 
 import (
+	"bytes"
 	"fmt"
 	"log/slog"
 	"math"
@@ -12,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Dash-Industry-Forum/livesim2/pkg/drm"
 	"github.com/Dash-Industry-Forum/livesim2/pkg/scte35"
 	m "github.com/Eyevinn/dash-mpd/mpd"
 )
@@ -51,7 +53,7 @@ func genLaURL(cfg *ResponseConfig) string {
 }
 
 // LiveMPD generates a dynamic configured MPD for a VoD asset.
-func LiveMPD(a *asset, mpdName string, cfg *ResponseConfig, nowMS int) (*m.MPD, error) {
+func LiveMPD(a *asset, mpdName string, cfg *ResponseConfig, drmCfg *drm.DrmConfig, nowMS int) (*m.MPD, error) {
 	mpd, err := a.getVodMPD(mpdName)
 	if err != nil {
 		return nil, err
@@ -87,7 +89,11 @@ func LiveMPD(a *asset, mpdName string, cfg *ResponseConfig, nowMS int) (*m.MPD, 
 				strBuf.WriteString(cfg.URLParts[i])
 			}
 		}
-		mpd.Location = []m.AnyURI{m.AnyURI(strBuf.String())}
+		mpd.Location = []*m.LocationType{
+			&m.LocationType{
+				Value: strBuf.String(),
+			},
+		}
 	}
 
 	if cfg.getAvailabilityTimeOffsetS() > 0 {
@@ -128,33 +134,107 @@ func LiveMPD(a *asset, mpdName string, cfg *ResponseConfig, nowMS int) (*m.MPD, 
 	adaptationSets := orderAdaptationSetsByContentType(period.AdaptationSets)
 	var refSegEntries segEntries
 	for asIdx, as := range adaptationSets {
+		if as.SegmentTemplate != nil {
+			as.SegmentTemplate.EndNumber = nil // Never output endNumber
+		}
 		switch as.ContentType {
 		case "video", "audio":
 			if cfg.PatchTTL > 0 && as.Id == nil {
 				slog.Debug("Inserting ID for AdaptationSet for patch", "contentType", as.ContentType, "id", asIdx+1)
 				as.Id = Ptr(uint32(asIdx + 1))
 			}
-			if cfg.DashIFECCP != "" {
+			if cfg.DRM != "" {
 				if a.refRep.PreEncrypted {
-					return nil, fmt.Errorf("pre-encrypted asset %s cannot be encrypted again", a.AssetPath)
+					return nil, fmt.Errorf("drm parameter %q, but pre-encrypted asset %s cannot be encrypted again",
+						cfg.DRM, a.AssetPath)
 				}
-				laURL := genLaURL(cfg)
-				cp := m.NewContentProtection()
-				cp.SchemeIdUri = "urn:mpeg:dash:mp4protection:2011"
-				cp.Value = cfg.DashIFECCP
-				cp.DefaultKID = kidFromString(laURL).String()
-				as.ContentProtections = append(as.ContentProtections, cp)
-				cp = m.NewContentProtection()
-				cp.SchemeIdUri = m.DRM_CLEAR_KEY_DASHIF
-				cp.Value = "ClearKey1.0"
-				laUrl := genLaURL(cfg)
-				cp.LaURL = &m.LaURLType{
-					LicenseType: "EME-1.0",
-					Value:       m.AnyURI(laUrl),
+				switch cfg.DRM {
+				case "eccp-cenc", "eccp-cbcs":
+					if a.refRep.PreEncrypted {
+						return nil, fmt.Errorf("pre-encrypted asset %s cannot be encrypted again", a.AssetPath)
+					}
+					laURL := genLaURL(cfg)
+					cp := m.NewContentProtection()
+					cp.SchemeIdUri = "urn:mpeg:dash:mp4protection:2011"
+					cp.Value = cfg.DRM[5:]
+					cp.DefaultKID = kidFromString(laURL).String()
+					as.ContentProtections = append(as.ContentProtections, cp)
+					cp = m.NewContentProtection()
+					cp.SchemeIdUri = m.DRM_CLEAR_KEY_DASHIF
+					cp.Value = "ClearKey1.0"
+					cp.LaURL = &m.LaURLType{
+						LicenseType: "EME-1.0",
+						Value:       m.AnyURI(laURL),
+					}
+					as.ContentProtections = append(as.ContentProtections, cp)
+				default:
+					if drmCfg == nil {
+						return nil, fmt.Errorf("drm parameter %q, but no DRM configured", cfg.DRM)
+					}
+					d, ok := drmCfg.Map[cfg.DRM]
+					if !ok {
+						return nil, fmt.Errorf("drm parameter %q, but no matching  DRM configuration found", cfg.DRM)
+					}
+					key, err := d.CPIXData.GetContentKey(string(as.ContentType))
+					if err != nil {
+						return nil, fmt.Errorf("get content key: %w", err)
+					}
+					keyID := key.KeyID
+					cp := m.NewContentProtection()
+					cp.SchemeIdUri = "urn:mpeg:dash:mp4protection:2011"
+					cp.DefaultKID = keyID.String()
+					cp.Value = key.CommonEncryptionScheme
+					as.ContentProtections = append(as.ContentProtections, cp)
+					for _, drmSys := range d.CPIXData.DRMSystems {
+						if !bytes.Equal(drmSys.KeyID, keyID) {
+							continue
+						}
+						fullURN := fmt.Sprintf("urn:uuid:%s", drmSys.SystemID)
+						drmSystem, ok := drm.DrmNames[fullURN]
+						if !ok {
+							return nil, fmt.Errorf("unknown DRM system %s", fullURN)
+						}
+						cpValue, ok := drm.ContentProtectionValues[fullURN]
+						if !ok {
+							return nil, fmt.Errorf("unknown DRM system %s", fullURN)
+						}
+						laURL := d.URLs[drmSystem].LaURL
+						if laURL == "" {
+							slog.Info("no LaURL for CPIX DRM", "DRM", drmSystem)
+							continue
+						}
+
+						cp = m.NewContentProtection()
+						cp.SchemeIdUri = m.AnyURI(fullURN)
+						cp.Value = cpValue
+						if drmSys.PSSH != "" {
+							cp.Pssh = &m.PsshType{
+								Value: drmSys.PSSH,
+							}
+						}
+						cp.LaURL = &m.LaURLType{
+							LicenseType: "EME-1.0",
+							Value:       m.AnyURI(laURL),
+						}
+						if drmSys.SmoothStreamingProtectionHeaderData != "" {
+							cp.MSPro = &m.MSProType{
+								Value: drmSys.SmoothStreamingProtectionHeaderData,
+							}
+						}
+						as.ContentProtections = append(as.ContentProtections, cp)
+					}
 				}
-				as.ContentProtections = append(as.ContentProtections, cp)
 			}
 		}
+		if as.ContentType == "video" && cfg.Query != nil {
+			ep := m.NewDescriptor(UrlParamSchemeIdUri, "", "")
+			ep.UrlQueryInfo = &m.UrlQueryInfoType{
+				QueryTemplate:  "$querypart$",
+				UseMPDUrlQuery: true,
+			}
+			as.EssentialProperties = append(as.EssentialProperties, ep)
+		}
+
 		if as.ContentType == "video" && cfg.SCTE35PerMinute != nil {
 			// Add SCTE35 signaling
 			as.InbandEventStreams = append(as.InbandEventStreams,
@@ -163,7 +243,7 @@ func LiveMPD(a *asset, mpdName string, cfg *ResponseConfig, nowMS int) (*m.MPD, 
 					Value:       "",
 				})
 		}
-		atoMS, err := setOffsetInAdaptationSet(cfg, a, as)
+		atoMS, err := setOffsetInAdaptationSet(cfg, as)
 		if err != nil {
 			return nil, err
 		}
@@ -177,7 +257,7 @@ func LiveMPD(a *asset, mpdName string, cfg *ResponseConfig, nowMS int) (*m.MPD, 
 			case "video", "text", "image":
 				se = a.generateTimelineEntries(as.Representations[0].Id, wTimes, atoMS)
 			case "audio":
-				se = a.generateTimelineEntriesFromRef(refSegEntries, as.Representations[0].Id, wTimes, atoMS)
+				se = a.generateTimelineEntriesFromRef(refSegEntries, as.Representations[0].Id)
 			default:
 				return nil, fmt.Errorf("unknown content type %s", as.ContentType)
 			}
@@ -189,7 +269,7 @@ func LiveMPD(a *asset, mpdName string, cfg *ResponseConfig, nowMS int) (*m.MPD, 
 		}
 		switch templateType {
 		case timeLineTime:
-			err := adjustAdaptationSetForTimelineTime(cfg, se, as)
+			err := adjustAdaptationSetForTimelineTime(se, as)
 			if err != nil {
 				return nil, fmt.Errorf("adjustASForTimelineTime: %w", err)
 			}
@@ -197,7 +277,7 @@ func LiveMPD(a *asset, mpdName string, cfg *ResponseConfig, nowMS int) (*m.MPD, 
 				mpd.PublishTime = m.ConvertToDateTime(calcPublishTime(cfg, se.lsi))
 			}
 		case timeLineNumber:
-			err := adjustAdaptationSetForTimelineNr(cfg, se, as)
+			err := adjustAdaptationSetForTimelineNr(se, as)
 			if err != nil {
 				return nil, fmt.Errorf("adjustASForTimelineNr: %w", err)
 			}
@@ -205,7 +285,7 @@ func LiveMPD(a *asset, mpdName string, cfg *ResponseConfig, nowMS int) (*m.MPD, 
 				mpd.PublishTime = m.ConvertToDateTime(calcPublishTime(cfg, se.lsi))
 			}
 		case segmentNumber:
-			err := adjustAdaptationSetForSegmentNumber(cfg, a, as, wTimes)
+			err := adjustAdaptationSetForSegmentNumber(cfg, a, as)
 			if err != nil {
 				return nil, fmt.Errorf("adjustASForSegmentNumber: %w", err)
 			}
@@ -259,7 +339,7 @@ func LiveMPD(a *asset, mpdName string, cfg *ResponseConfig, nowMS int) (*m.MPD, 
 	return mpd, nil
 }
 
-// lastSegInfo returns the absolute startTime of the last Period.
+// lastPeriodStartTime returns the absolute startTime of the last Period.
 func lastPeriodStartTime(mpd *m.MPD) (m.DateTime, error) {
 	lastPeriod := mpd.Periods[len(mpd.Periods)-1]
 	lastRelStartS := time.Duration(*lastPeriod.Start).Seconds()
@@ -466,9 +546,22 @@ func (s segEntries) lastNr() int {
 	return s.startNr + nrSegs - 1
 }
 
+func (s segEntries) lastTime() uint64 {
+	t := uint64(0)
+	lastD := uint64(0)
+	for _, e := range s.entries {
+		if e.T != nil {
+			t = *e.T
+		}
+		t += e.D * (uint64(e.R) + 1)
+		lastD = e.D
+	}
+	return t - lastD
+}
+
 // setOffsetInAdaptationSet sets the availabilityTimeOffset in the AdaptationSet.
 // Returns ErrAtoInfTimeline if infinite ato set with timeline.
-func setOffsetInAdaptationSet(cfg *ResponseConfig, a *asset, as *m.AdaptationSetType) (atoMS int, err error) {
+func setOffsetInAdaptationSet(cfg *ResponseConfig, as *m.AdaptationSetType) (atoMS int, err error) {
 	if as.SegmentTemplate == nil {
 		return 0, fmt.Errorf("no SegmentTemplate in AdaptationSet")
 	}
@@ -492,25 +585,25 @@ func setOffsetInAdaptationSet(cfg *ResponseConfig, a *asset, as *m.AdaptationSet
 	return atoMS, nil
 }
 
-func adjustAdaptationSetForTimelineTime(cfg *ResponseConfig, se segEntries, as *m.AdaptationSetType) error {
+func adjustAdaptationSetForTimelineTime(se segEntries, as *m.AdaptationSetType) error {
 	if as.SegmentTemplate.SegmentTimeline == nil {
 		as.SegmentTemplate.SegmentTimeline = &m.SegmentTimelineType{}
 	}
 	as.SegmentTemplate.StartNumber = nil
 	as.SegmentTemplate.Duration = nil
-	as.SegmentTemplate.Media = strings.Replace(as.SegmentTemplate.Media, "$Number$", "$Time$", -1)
+	as.SegmentTemplate.Media = strings.ReplaceAll(as.SegmentTemplate.Media, "$Number$", "$Time$")
 	as.SegmentTemplate.Timescale = Ptr(se.mediaTimescale)
 	as.SegmentTemplate.SegmentTimeline.S = se.entries
 	return nil
 }
 
-func adjustAdaptationSetForTimelineNr(cfg *ResponseConfig, se segEntries, as *m.AdaptationSetType) error {
+func adjustAdaptationSetForTimelineNr(se segEntries, as *m.AdaptationSetType) error {
 	if as.SegmentTemplate.SegmentTimeline == nil {
 		as.SegmentTemplate.SegmentTimeline = &m.SegmentTimelineType{}
 	}
 	as.SegmentTemplate.StartNumber = nil
 	as.SegmentTemplate.Duration = nil
-	as.SegmentTemplate.Media = strings.Replace(as.SegmentTemplate.Media, "$Time$", "$Number$", -1)
+	as.SegmentTemplate.Media = strings.ReplaceAll(as.SegmentTemplate.Media, "$Time$", "$Number$")
 	as.SegmentTemplate.Timescale = Ptr(se.mediaTimescale)
 	as.SegmentTemplate.SegmentTimeline.S = se.entries
 
@@ -520,7 +613,7 @@ func adjustAdaptationSetForTimelineNr(cfg *ResponseConfig, se segEntries, as *m.
 	return nil
 }
 
-func adjustAdaptationSetForSegmentNumber(cfg *ResponseConfig, a *asset, as *m.AdaptationSetType, wt wrapTimes) error {
+func adjustAdaptationSetForSegmentNumber(cfg *ResponseConfig, a *asset, as *m.AdaptationSetType) error {
 	if as.SegmentTemplate.Duration == nil {
 		r0 := as.Representations[0]
 		rep0 := a.Reps[r0.Id]
@@ -540,7 +633,7 @@ func adjustAdaptationSetForSegmentNumber(cfg *ResponseConfig, a *asset, as *m.Ad
 		startNr := Ptr(uint32(*cfg.StartNr))
 		as.SegmentTemplate.StartNumber = startNr
 	}
-	as.SegmentTemplate.Media = strings.Replace(as.SegmentTemplate.Media, "$Time$", "$Number$", -1)
+	as.SegmentTemplate.Media = strings.ReplaceAll(as.SegmentTemplate.Media, "$Time$", "$Number$")
 	return nil
 }
 
@@ -716,7 +809,6 @@ func changeTimelineTimescale(inSTL *m.SegmentTimelineType, oldTimescale, newTime
 			N: nil,
 			D: round(s.D),
 			R: s.R,
-			K: nil,
 		}
 		o.S = append(o.S, &outS)
 	}
@@ -765,7 +857,7 @@ func fillContentTypes(assetPath string, period *m.Period) {
 }
 
 var videoCodecPrefixes = []string{"avc", "hev", "hvc"}
-var audioCodecPrefixes = []string{"mp4a", "ac-3", "ec-3"}
+var audioCodecPrefixes = []string{"mp4a", "ac-3", "ec-3", "ac-4"}
 var textCodecPrefixes = []string{"stpp", "wvtt"}
 
 func matchesPrefix(s string, prefixes []string) bool {
@@ -777,7 +869,7 @@ func matchesPrefix(s string, prefixes []string) bool {
 	return false
 }
 
-// guesssContentTypeForAS guesses the content type based on codecs and other data in the AdaptationSet or its Representations.
+// guessContentTypeForAS guesses the content type based on codecs and other data in the AdaptationSet or its Representations.
 func guessContentTypeForAS(as *m.AdaptationSetType) string {
 	if as.Codecs != "" {
 		switch {

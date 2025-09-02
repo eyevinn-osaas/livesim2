@@ -64,6 +64,10 @@ const (
 	UtcTimingHeadAsset       = "/static/time.txt"
 )
 
+const (
+	UrlParamSchemeIdUri = "urn:mpeg:dash:urlparam:2014"
+)
+
 type ResponseConfig struct {
 	URLParts                     []string          `json:"-"`
 	URLContentIdx                int               `json:"-"`
@@ -102,10 +106,10 @@ type ResponseConfig struct {
 	TimeSubsRegion               int               `json:"TimeSubsRegion,omitempty"`
 	Host                         string            `json:"Host,omitempty"`
 	PatchTTL                     int               `json:"Patch,omitempty"`
-	// DashIFECCP is DASH-IF Enhanced Clear Key Content Protection
-	DashIFECCP     string           `json:"ECCP,omitempty"`
-	SegStatusCodes []SegStatusCodes `json:"SegStatus,omitempty"`
-	Traffic        []LossItvls      `json:"Traffic,omitempty"`
+	DRM                          string            `json:"DRM,omitempty"` // Includes ECCP as eccp-cbcs or eccp-cenc
+	SegStatusCodes               []SegStatusCodes  `json:"SegStatus,omitempty"`
+	Traffic                      []LossItvls       `json:"Traffic,omitempty"`
+	Query                        *Query            `json:"Query,omitempty"`
 }
 
 // SegStatusCodes configures regular extraordinary segment response codes
@@ -223,6 +227,11 @@ type LossItvl struct {
 	state lossState
 }
 
+type Query struct {
+	raw   string
+	parts url.Values
+}
+
 func baseURL(nr int) string {
 	return fmt.Sprintf("bu%d/", nr)
 }
@@ -311,7 +320,7 @@ cfgLoop:
 			cfg.AddLocationFlag = true
 		case "dur": // Adds a presentation duration for multiple periods
 			cfg.PeriodDurations = append(cfg.PeriodDurations, sc.Atoi(key, val))
-		case "timeoffset": //Time offset in seconds version NTP
+		case "timeoffset": //Time offset in seconds versus NTP
 			cfg.TimeOffsetS = sc.Atof(key, val)
 		case "init": // Make the init segment available earlier
 			cfg.InitSegAvailOffsetS = sc.AtoiPtr(key, val)
@@ -374,13 +383,17 @@ cfgLoop:
 			cfg.SegStatusCodes = sc.ParseSegStatusCodes(key, val)
 		case "traffic":
 			cfg.Traffic = sc.ParseLossItvls(key, val)
+		case "drm":
+			cfg.DRM = val
 		case "eccp":
-			cfg.DashIFECCP = val
+			cfg.DRM = "eccp-" + val
 		case "patch":
 			ttl := sc.Atoi(key, val)
 			if ttl > 0 {
 				cfg.PatchTTL = ttl
 			}
+		case "annexI":
+			cfg.Query = sc.ParseQuery(key, val)
 		default:
 			contentStartIdx = i
 			break cfgLoop
@@ -402,6 +415,9 @@ cfgLoop:
 }
 
 func verifyAndFillConfig(cfg *ResponseConfig, nowMS int) error {
+	if nowMS < 0 {
+		return fmt.Errorf("nowMS must be >= 0")
+	}
 	if cfg.SegTimelineNrFlag && cfg.SegTimelineFlag {
 		return fmt.Errorf("SegmentTimelineTime and SegmentTimelineNr cannot be used at same time")
 	}
@@ -429,12 +445,8 @@ func verifyAndFillConfig(cfg *ResponseConfig, nowMS int) error {
 			return err
 		}
 	}
-	switch cfg.DashIFECCP {
-	case "", "cenc", "cbcs":
-		// OK
-	default:
-		return fmt.Errorf("invalid DASH-IF Enhanced Clear Key Content Protection eccp  %q", cfg.DashIFECCP)
-	}
+	// We do not check here that the drm is one that has been configured,
+	// since pre-encrypted content will influence what is valid.
 	return nil
 }
 

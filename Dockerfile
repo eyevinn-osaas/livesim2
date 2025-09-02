@@ -5,13 +5,19 @@
 
 # Build as "docker build -t livesim2 ."
 # Run as "docker run -p 8888:8888 livesim2"
+# Mount a volume with VoD Content at /vod to have livesim2 serve everything below it
 
 # Build Stage
-FROM golang:1.21.3-alpine3.18 AS BuildStage
+FROM golang:1.23.1-alpine3.20 AS BuildStage
+RUN apk add git
 WORKDIR /work
 COPY . .
 RUN go mod download
-RUN go build  -o ./out/livesim2 ./cmd/livesim2/main.go
+ARG COMMIT_DATE
+RUN COMMIT_DATE=$(git log -1 --format=%ct)
+ARG VERSION
+RUN VERSION=$(git describe --tags HEAD)
+RUN go build  -ldflags "-X github.com/Dash-Industry-Forum/livesim2/internal.commitVersion=$VERSION -X github.com/Dash-Industry-Forum/livesim2/internal.commitDate=$COMMIT_DATE" -o ./out/livesim2 ./cmd/livesim2/main.go
 # Deploy Stage
 FROM alpine:latest
 RUN apk add --no-cache git git-lfs

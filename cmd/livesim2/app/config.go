@@ -18,6 +18,7 @@ import (
 	"github.com/knadh/koanf/providers/posflag"
 	"github.com/knadh/koanf/providers/structs"
 
+	"github.com/Dash-Industry-Forum/livesim2/pkg/drm"
 	"github.com/Dash-Industry-Forum/livesim2/pkg/logging"
 	"github.com/spf13/pflag"
 )
@@ -31,7 +32,8 @@ const (
 	timeShiftBufferDepthMarginS     = 10
 	defaultTimeSubsDurMS            = 900
 	defaultLatencyTargetMS          = 3500
-	defaultPlayURL                  = "https://reference.dashif.org/dash.js/latest/samples/dash-if-reference-player/index.html?mpd=%s&autoLoad=true&muted=true"
+	//nolint:lll
+	defaultPlayURL = "https://reference.dashif.org/dash.js/latest/samples/dash-if-reference-player/index.html?mpd=%s&autoLoad=true&muted=true"
 )
 
 type ServerConfig struct {
@@ -43,7 +45,9 @@ type ServerConfig struct {
 	LiveWindowS int    `json:"livewindowS"`
 	TimeoutS    int    `json:"timeoutS"`
 	MaxRequests int    `json:"maxrequests"`
-	VodRoot     string `json:"vodroot"`
+	// WhiteListBlocks is a comma-separated list of CIDR blocks that are not rate limited
+	WhiteListBlocks string `json:"whitelistblocks"`
+	VodRoot         string `json:"vodroot"`
 	// RepDataRoot is the root directory for representation metadata
 	RepDataRoot string `json:"repdataroot"`
 	// WriteRepData is true if representation metadata should be written (will override existing metadata)
@@ -58,7 +62,9 @@ type ServerConfig struct {
 	Host string `json:"host"`
 	// PlayURL is a URL template to play asset including player and pattern %s to be replaced by MPD URL
 	// For autoplay, start the player muted.
-	PlayURL string `json:"playurl"`
+	PlayURL    string         `json:"playurl"`
+	DrmCfgFile string         `json:"drmcfgfile"`
+	DrmCfg     *drm.DrmConfig `json:"drmcfg"`
 }
 
 var DefaultConfig = ServerConfig{
@@ -71,9 +77,10 @@ var DefaultConfig = ServerConfig{
 	ReqLimitInt: defaultReqIntervalS,
 	VodRoot:     "./vod",
 	// MetaRoot + means follow VodRoot, _ means no metadata
-	RepDataRoot:  "+",
-	WriteRepData: false,
-	PlayURL:      defaultPlayURL,
+	RepDataRoot:     "+",
+	WriteRepData:    false,
+	PlayURL:         defaultPlayURL,
+	WhiteListBlocks: "",
 }
 
 type Config struct {
@@ -112,7 +119,8 @@ func LoadConfig(args []string, cwd string) (*ServerConfig, error) {
 	f.String("vodroot", k.String("vodroot"), "VoD root directory")
 	f.String("repdataroot", k.String("repdataroot"), `Representation metadata root directory. "+" copies vodroot value. "-" disables usage.`)
 	f.Bool("writerepdata", k.Bool("writerepdata"), "Write representation metadata if not present")
-	f.Int("timeout", k.Int("timeoutS"), "timeout for all requests (seconds)")
+	f.String("whitelistblocks", k.String("whitelistblocks"), "comma-separated list of CIDR blocks that are not rate limited")
+	f.Int("timeoutS", k.Int("timeouts"), "timeout for all requests (seconds)")
 	f.Int("maxrequests", k.Int("maxrequests"), "max nr of request per IP address per 24 hours")
 	f.String("reqlimitlog", k.String("reqlimitlog"), "path to request limit log file (only written if maxrequests > 0)")
 	f.Int("reqlimitint", k.Int("reqlimitint"), "interval for request limit i seconds (only used if maxrequests > 0)")
@@ -122,6 +130,8 @@ func LoadConfig(args []string, cwd string) (*ServerConfig, error) {
 	f.String("scheme", k.String("scheme"), "scheme used in Location and BaseURL elements. If empty, it is attempted to be auto-detected")
 	f.String("host", k.String("host"), "host (and possible prefix) used in MPD elements. Overrides auto-detected full scheme://host")
 	f.String("playurl", k.String("playurl"), "URL template to play mpd. %s will be replaced by MPD URL")
+	f.String("drmcfgfile", k.String("drmcfgfile"), "DRM config file path")
+
 	if err := f.Parse(args[1:]); err != nil {
 		return nil, fmt.Errorf("command line parse: %w", err)
 	}
@@ -141,8 +151,8 @@ func LoadConfig(args []string, cwd string) (*ServerConfig, error) {
 
 	// Overload with environment variables
 	err = k.Load(env.Provider("LIVESIM_", ".", func(s string) string {
-		return strings.Replace(strings.ToLower(
-			strings.TrimPrefix(s, "LIVESIM_")), "_", ".", -1)
+		return strings.ReplaceAll(strings.ToLower(
+			strings.TrimPrefix(s, "LIVESIM_")), "_", ".")
 	}), nil)
 	if err != nil {
 		return nil, err
@@ -154,15 +164,9 @@ func LoadConfig(args []string, cwd string) (*ServerConfig, error) {
 	}
 
 	// Make vodPath absolute in case it is not already
-	vodRoot := k.String("vodroot")
-	if vodRoot != "" && !path.IsAbs(vodRoot) {
-		vodRoot = path.Join(cwd, vodRoot)
-		err = k.Load(confmap.Provider(map[string]any{
-			"vodroot": vodRoot,
-		}, "."), nil)
-		if err != nil {
-			return nil, err
-		}
+	vodRoot, err := makeAbsolutePath(k, "vodroot", cwd)
+	if err != nil {
+		return nil, fmt.Errorf("make vodroot absolute: %w", err)
 	}
 	// Update repDataRoot to consistent value including absolute path
 	repDataRoot := k.String("repdataroot")
@@ -211,6 +215,12 @@ func LoadConfig(args []string, cwd string) (*ServerConfig, error) {
 		}
 	}
 
+	// Make drmconfig absolute in case it is not already
+	_, err = makeAbsolutePath(k, "drmconfig", cwd)
+	if err != nil {
+		return nil, fmt.Errorf("make drmconfig absolute: %w", err)
+	}
+
 	// Unmarshal into cfg
 	var cfg ServerConfig
 	if err := k.Unmarshal("", &cfg); err != nil {
@@ -218,6 +228,20 @@ func LoadConfig(args []string, cwd string) (*ServerConfig, error) {
 	}
 
 	return &cfg, nil
+}
+
+func makeAbsolutePath(k *koanf.Koanf, key, cwd string) (string, error) {
+	absPath := k.String(key)
+	if absPath != "" && !path.IsAbs(absPath) {
+		absPath = path.Join(cwd, absPath)
+		err := k.Load(confmap.Provider(map[string]any{
+			key: absPath,
+		}, "."), nil)
+		if err != nil {
+			return "", err
+		}
+	}
+	return absPath, nil
 }
 
 func checkTLSParams(k *koanf.Koanf) error {

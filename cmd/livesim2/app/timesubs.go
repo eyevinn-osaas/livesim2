@@ -15,6 +15,7 @@ import (
 	"text/template"
 	"time"
 
+	"github.com/Eyevinn/mp4ff/bits"
 	"github.com/Eyevinn/mp4ff/mp4"
 )
 
@@ -51,14 +52,14 @@ func isTimeSubsInitSegment(prefix, segmentPart string) (lang string, ok bool) {
 	return "", false
 }
 
-func writeTimeSubsInitSegment(w http.ResponseWriter, cfg *ResponseConfig, a *asset, segmentPart string) (bool, error) {
-	prefix := ""
+func matchTimeSubsInitLang(cfg *ResponseConfig, segmentPart string) (prefix, lang string, ok bool, err error) {
+	lang, ok = isTimeSubsInitSegment(SUBS_STPP_PREFIX, segmentPart)
 	var langs []string
-	lang, ok := isTimeSubsInitSegment(SUBS_STPP_PREFIX, segmentPart)
 	if ok {
 		prefix = SUBS_STPP_PREFIX
 		langs = cfg.TimeSubsStpp
-	} else {
+	}
+	if !ok {
 		lang, ok = isTimeSubsInitSegment(SUBS_WVTT_PREFIX, segmentPart)
 		if ok {
 			prefix = SUBS_WVTT_PREFIX
@@ -66,8 +67,8 @@ func writeTimeSubsInitSegment(w http.ResponseWriter, cfg *ResponseConfig, a *ass
 		}
 	}
 
-	if prefix == "" {
-		return false, nil
+	if !ok {
+		return "", "", false, nil
 	}
 
 	matchingLang := false
@@ -78,12 +79,23 @@ func writeTimeSubsInitSegment(w http.ResponseWriter, cfg *ResponseConfig, a *ass
 		}
 	}
 	if !matchingLang {
-		return true, fmt.Errorf("time subs language %q does not match config: %w", lang, errNotFound)
+		return "", lang, true, fmt.Errorf("time subs language %q does not match config: %w", lang, errNotFound)
+	}
+	return prefix, lang, true, nil
+}
+
+func writeTimeSubsInitSegment(w http.ResponseWriter, cfg *ResponseConfig, segmentPart string) (bool, error) {
+	prefix, lang, ok, err := matchTimeSubsInitLang(cfg, segmentPart)
+	if !ok {
+		return false, nil
+	}
+	if err != nil {
+		return true, err
 	}
 	init := createTimeSubsInitSegment(prefix, lang, SUBS_TIME_TIMESCALE)
 	w.Header().Set("Content-Type", "application/mp4")
 	w.Header().Set("Content-Length", strconv.Itoa(int(init.Size())))
-	err := init.Encode(w)
+	err = init.Encode(w)
 	if err != nil {
 		slog.Error("write init response", "error", err)
 		return true, err
@@ -102,7 +114,7 @@ func createTimeSubsInitSegment(prefix, lang string, timescale uint32) *mp4.InitS
 
 func createSubtitlesStppInitSegment(lang string, timescale uint32) *mp4.InitSegment {
 	init := mp4.CreateEmptyInit()
-	init.AddEmptyTrack(timescale, "stpp", lang)
+	init.AddEmptyTrack(timescale, "subt", lang)
 	trak := init.Moov.Trak
 	schemaLocation := ""
 	auxiliaryMimeType := ""
@@ -126,7 +138,8 @@ type StppTimeCue struct {
 }
 
 // writeTimeStppMediaSegment return true and tries to write a stpp time subtitle segment if URL matches
-func writeTimeSubsMediaSegment(w http.ResponseWriter, cfg *ResponseConfig, a *asset, segmentPart string, nowMS int, tt *template.Template) (bool, error) {
+func writeTimeSubsMediaSegment(w http.ResponseWriter, cfg *ResponseConfig, a *asset, segmentPart string, nowMS int,
+	tt *template.Template, isLast bool) (bool, error) {
 	prefix := ""
 	var langs []string
 	lang, seg, ok := timeSubsSegmentParts(SUBS_STPP_PREFIX, segmentPart)
@@ -169,7 +182,7 @@ func writeTimeSubsMediaSegment(w http.ResponseWriter, cfg *ResponseConfig, a *as
 	// This is done by looking up a corresponding video segment.
 	// That segments also gives the right time range
 
-	refSegMeta, err := a.getRefSegMeta(nrOrTime, cfg, SUBS_TIME_TIMESCALE, nowMS)
+	refSegMeta, err := a.getRefSegMeta(nrOrTime, cfg, nowMS)
 	if err != nil {
 		return true, fmt.Errorf("getRefSegMeta: %w", err)
 	}
@@ -186,17 +199,27 @@ func writeTimeSubsMediaSegment(w http.ResponseWriter, cfg *ResponseConfig, a *as
 			tt, cfg.TimeSubsDurMS, cfg.TimeSubsRegion)
 	default: // SUBS_WVTT_PREFIX
 		mediaSeg, err = createSubtitlesWvttMediaSegment(refSegMeta.newNr, baseMediaDecodeTime, dur, lang, utcTimeMS,
-			tt, cfg.TimeSubsDurMS, cfg.TimeSubsRegion)
+			cfg.TimeSubsDurMS, cfg.TimeSubsRegion)
+	}
+	if isLast {
+		mediaSeg.Styp.AddCompatibleBrands([]string{"lmsg"})
 	}
 	if err != nil {
 		return true, fmt.Errorf("createSubtitleStppMediaSegment: %w", err)
 	}
+	length := int(mediaSeg.Size())
 	w.Header().Set("Content-Type", "application/mp4")
-	w.Header().Set("Content-Length", strconv.Itoa(int(mediaSeg.Size())))
-	err = mediaSeg.Encode(w)
+	w.Header().Set("Content-Length", strconv.Itoa(length))
+	sw := bits.NewFixedSliceWriter(length)
+	err = mediaSeg.EncodeSW(sw)
+	if err != nil {
+		slog.Error("generate media segment", "error", err)
+		return true, fmt.Errorf("mediaSegGen: %w", err)
+	}
+	_, err = w.Write(sw.Bytes())
 	if err != nil {
 		slog.Error("write media segment response", "error", err)
-		return true, fmt.Errorf("mediaSeg: %w", err)
+		return true, fmt.Errorf("mediaSegSend: %w", err)
 	}
 	return true, nil
 }

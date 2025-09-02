@@ -68,6 +68,7 @@ func TestParamToMPD(t *testing.T) {
 			mpd:              "testpic_2s/Manifest.mpd",
 			params:           "eccp_cbcs/",
 			wantedStatusCode: http.StatusOK,
+			//nolint:lll
 			wantedInMPD: []string{
 				`<ContentProtection xmlns:cenc="urn:mpeg:cenc:2013" cenc:default_KID="2880fe36-e44b-f9bf-79d2-752e234818a5" schemeIdUri="urn:mpeg:dash:mp4protection:2011" value="cbcs"></ContentProtection>`,
 				`<ContentProtection schemeIdUri="urn:uuid:e2719d58-a985-b3c9-781a-b030af78d30e" value="ClearKey1.0">`,
@@ -84,6 +85,23 @@ func TestParamToMPD(t *testing.T) {
 				`id="1"`,             // id in AdaptationSet
 				`id="2"`,             // id in AdaptationSet
 				`<PatchLocation ttl="60">/patch/livesim2/patch_60/testpic_6s/Manifest.mpp?publishTime=`, // PatchLocation
+			},
+		},
+		{
+			desc:             "annexI without url query",
+			mpd:              "testpic_2s/Manifest.mpd",
+			params:           "annexI_a=1,b=3,a=3/",
+			wantedStatusCode: http.StatusBadRequest,
+			wantedInMPD:      nil,
+		},
+		{
+			desc:             "annexI with url query",
+			mpd:              "testpic_2s/Manifest.mpd?a=1&b=3&a=3",
+			params:           "annexI_a=1,b=3,a=3/",
+			wantedStatusCode: http.StatusOK,
+			wantedInMPD: []string{
+				`<EssentialProperty schemeIdUri="urn:mpeg:dash:urlparam:2014">`,
+				`<up:UrlQueryInfo xmlns:up="urn:mpeg:dash:schema:urlparam:2014" queryTemplate="$querypart$" useMPDUrlQuery="true"></up:UrlQueryInfo>`,
 			},
 		},
 	}
@@ -124,6 +142,13 @@ func TestFetches(t *testing.T) {
 		wantedStatusCode  int
 		wantedContentType string
 	}{
+		{
+			desc:              "mpd",
+			url:               "testpic_2s/Manifest_thumbs.mpd",
+			params:            "",
+			wantedStatusCode:  http.StatusOK,
+			wantedContentType: `application/dash+xml`,
+		},
 		{
 			desc:              "mpd",
 			url:               "testpic_2s/Manifest_thumbs.mpd",
@@ -186,6 +211,26 @@ func TestFetches(t *testing.T) {
 			params:            "",
 			wantedStatusCode:  425,
 			wantedContentType: `video/mp4`,
+		},
+		{
+			desc:             "video init segment Annex I, without query",
+			url:              "testpic_2s/V300/init.mp4",
+			params:           "annexI_a=1/",
+			wantedStatusCode: http.StatusBadRequest,
+		},
+		{
+			desc:              "video init segment Annex I, with query",
+			url:               "testpic_2s/V300/init.mp4?a=1",
+			params:            "annexI_a=1/",
+			wantedStatusCode:  http.StatusOK,
+			wantedContentType: `video/mp4`,
+		},
+		{
+			desc:              "audio init segment Annex I, without query",
+			url:               "testpic_2s/A48/init.mp4",
+			params:            "annexI_a=1/",
+			wantedStatusCode:  http.StatusOK,
+			wantedContentType: `audio/mp4`,
 		},
 	}
 

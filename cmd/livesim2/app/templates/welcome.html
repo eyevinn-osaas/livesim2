@@ -3,8 +3,8 @@
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <link rel="stylesheet" href="/static/pico.min.css">
-    <link rel="stylesheet" href="/static/custom.css">
+    <link rel="stylesheet" href="{{.Host}}/static/pico.min.css">
+    <link rel="stylesheet" href="{{.Host}}/static/custom.css">
     <title>livesim2</title>
   </head>
   <body>
@@ -31,6 +31,9 @@
         any other configured player. However, some restrictions may apply as discussed on the Wiki page
         <a href="https://github.com/Dash-Industry-Forum/livesim2/wiki/Direct-Playback">Direct Playback</a>.</p>
 
+      <p>A new feature is <strong>CMAF ingest generation</strong>. For testing reception of such streams,
+        there is also a separate component "cmaf-ingest-receiver" available in the livesim2 Github repo.</p>
+
       <h4>Useful local URLs</h4>
 
       <p>The following URLs should work at {{.Host}}. Some of them provides streaming URLs or even URLs that start
@@ -45,7 +48,10 @@
         <li><a href="{{.Host}}/metrics">/metrics</a> return  Prometheus metrics for the system and all streaming content requests</li>
         <li><a href="{{.Host}}/reqcount">/reqcount</a> returns the number of requests if a limit is set</li>
         <li><a href="{{.Host}}/version">/version</a> returns the software version in JSON format</li>
+        <li><a href="{{.Host}}/api/docs#/">/api/docs</a> provides documentation for a REST API for <strong>CMAF ingest generation</strong> of streams to specified hosts</li>
       </ul>
+
+
 
       <h4>Further information</h4>
 
@@ -54,6 +60,7 @@
       <ul>
         <li><a href="https://github.com/Dash-Industry-Forum/livesim2"  target="_blank">livesim2 Github project</a></li>
         <li><a href="https://github.com/Dash-Industry-Forum/livesim2/wiki" target="_blank">livesim2 Github Wiki</a></li>
+        <li><a href="https://github.com/Dash-Industry-Forum/livesim2/wiki/Preparing-Content-for-livesim2" target="_blank">Preparing Content for livesim2</a></li>
         <li><a href="https://github.com/Dash-Industry-Forum/livesim2/wiki/URL-Parameters" target="_blank">wiki list of url parameters</a></li>
         <li><a href="https://github.com/orgs/Dash-Industry-Forum/projects/7" target="_blank">Github project for planning new features</a></li>
         <li><a href="https://dashif.slack.com" target="_blank">The livesim channel in the DASH-IF slack</a></li>

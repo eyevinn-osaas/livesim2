@@ -9,13 +9,106 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- HEVC encryption support
+- AC-4 audio support including encryption
+- AC-3 and EC-3 encryption support
+- Support for CMAF-compliant audio edit list
+- Documented the CMAF edit list support for both audio and video
+
+### Changed
+
+- Minimal Go version is now 1.23
+- Updated dash-mpd to v0.13.0 (Full DASH Ed. 6 support)
+
+### Fixed
+
+- One HTTP PUT with Content-Length in cmaf-ingest
+- Fixed typo in urlgen template
+- Lost error reporting in initial segment parsing
+- Added `Access-Control-Expose-Header` to make UTCTiming HEAD work (Issue #251)
+
+### Added
+
+- Test asset with varying segment duration (4s and 8s) with exact 6s average
+- Described how to use Dockerfile from Github Container repository (ghcr.io)
+
+## [1.7.0] - 2025-01-17
+
+### Changed
+
+- CMAF ingest of full segments now send Content-Length header
+
+### Added
+
+- Basic Annex I support for announcing that MPD query parameters should be used in all video segment requests
+- Verification that the MPD and the video segments carry the URL-specified query parameters
+
+### Fixed
+
+- endNumber in live MPD (Issue #235)
+- urlgen page crashed when no DRM configuration
+- mpd part of play URL in urlgen is now query escaped
+- ContentProtect for DRMs in CPIX file with no configured LaURL
+- Updated to golangci-lint v2 and fixed all remarks
+
+### Chore
+
+- updated dependencies
+
+## [1.6.0] - 2024-12-03
+
+### Added
+
+- On-the-fly encryption with keys from commercial DRM (Widevine and PlayReady) via CPIX document
+- DRM configuration and URL generation on `urlgen` page
+- Unified ECCP and other DRMs using the new URL parameter `/drm_X`
+
+### Fixed
+
+- CLI parameter -h for livesim2
+
+## [1.5.2] - 2024-11-05
+
+### Fixed
+
+- Segment size bug for ECCP encryption (introduced in v1.5.1)
+- `--timeout` parameter not working. Changed to `--timeoutS`
+
+## [1.5.1] - 2024-11-01
+
+### Added
+
+- Better logging when loading asset representation data
+- Check that pre-encrypted content has the same duration for all representations
+- Test that endNumber in SegmentTemplate will limit segments used
+- Automatic build of Docker Images
+
+### Fixed
+
+- Pre-encrypted content is not re-fragmented, but left as it
+- Dockerfile to insert version in binary (requires full repo or tag)
+
+## [1.5.0] - 2024-10-02
+
+### Added
+
+- Added functions and constants for CMAF file extensions in pkg/cmaf
 - Short HEVC + AC-3 test content
+- Generation of CMAF ingest streams with a REST-based API
+- New program `cmaf-ingest-receiver` that can receive one or more CMAF ingest streams
+- New option `--whitelistblocks` for unlimited number of requests to some CIDR blocks
+- Much improved `cmaf-ingest-receiver`
+- Link on starting page to Wiki page on preparing content
 
 ### Fixed
 
 - Will now set contentType from mimeType on AdaptationSet or Representation level.
 - If contentType and mimedType is not present, contentType will be set from codecs string.
 - Issue with audio resegmentation.
+
+### Changed
+
+- Go version changed to 1.22
 
 ## [1.4.1] - 2024-05-28
 
@@ -242,7 +335,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - features and URLs listed at livesim2 root page
 - configurable generated stpp subtitles with timing info
 
-[Unreleased]: https://github.com/Dash-Industry-Forum/livesim2/compare/v1.4.1...HEAD
+[Unreleased]: https://github.com/Dash-Industry-Forum/livesim2/compare/v1.7.0...HEAD
+[1.7.0]: https://github.com/Dash-Industry-Forum/livesim2/compare/v1.6.0...v1.7.0
+[1.6.0]: https://github.com/Dash-Industry-Forum/livesim2/compare/v1.5.2...v1.6.0
+[1.5.2]: https://github.com/Dash-Industry-Forum/livesim2/compare/v1.5.1...v1.5.2
+[1.5.1]: https://github.com/Dash-Industry-Forum/livesim2/compare/v1.5.0...v1.5.1
+[1.5.0]: https://github.com/Dash-Industry-Forum/livesim2/compare/v1.4.1...v1.5.0
 [1.4.1]: https://github.com/Dash-Industry-Forum/livesim2/compare/v1.4.0...v1.4.1
 [1.4.0]: https://github.com/Dash-Industry-Forum/livesim2/compare/v1.3.1...v1.4.0
 [1.3.1]: https://github.com/Dash-Industry-Forum/livesim2/compare/v1.3.0...v1.3.1
