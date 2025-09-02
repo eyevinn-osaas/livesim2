@@ -24,5 +24,5 @@ RUN apk add --no-cache git git-lfs
 WORKDIR /
 COPY --from=BuildStage /work/out/ /
 COPY --from=BuildStage /work/cmd/livesim2/app/testdata/assets /vod
-COPY --from=BuildStage /work/entrypoint.sh /
-ENTRYPOINT ["/entrypoint.sh"]
+COPY --from=BuildStage /work/osc-entrypoint.sh /
+ENTRYPOINT ["/osc-entrypoint.sh"]
